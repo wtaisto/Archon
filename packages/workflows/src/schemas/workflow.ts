@@ -90,6 +90,21 @@ export type WorkflowBase = z.infer<typeof workflowBaseSchema>;
  */
 export const workflowDefinitionSchema = workflowBaseSchema.extend({
   nodes: z.array(dagNodeSchema),
+  /**
+   * Workflow-level loop expression. When set, the entire workflow re-runs as
+   * a fresh `WorkflowRun` (same `user_message`, scoped `nodeOutputs`) until
+   * this expression evaluates true against the just-completed iteration's
+   * node outputs, or `max_iterations` is reached.
+   *
+   * Parseable by `condition-evaluator.ts` — same syntax as `when:`.
+   */
+  loop_until: z.string().min(1).optional(),
+  /**
+   * Backstop iteration cap for `loop_until`. Defaults to 20 when omitted.
+   * If the loop never terminates within this many iterations, the workflow
+   * fails.
+   */
+  max_iterations: z.number().int().positive().optional(),
 });
 
 /** Workflow definition with fully typed nodes (DagNode[]) derived from the schema. */
