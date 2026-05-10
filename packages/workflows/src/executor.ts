@@ -8,8 +8,14 @@ import type { WorkflowDeps, WorkflowConfig } from './deps';
 import * as archonPaths from '@archon/paths';
 import { createLogger, captureWorkflowInvoked, BUNDLED_VERSION } from '@archon/paths';
 import { getDefaultBranch, toRepoPath } from '@archon/git';
-import type { WorkflowDefinition, WorkflowRun, WorkflowExecutionResult } from './schemas';
+import type {
+  WorkflowDefinition,
+  WorkflowRun,
+  WorkflowExecutionResult,
+  NodeOutput,
+} from './schemas';
 import { executeDagWorkflow } from './dag-executor';
+import { evaluateCondition } from './condition-evaluator';
 import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { getWorkflowEventEmitter } from './event-emitter';
@@ -227,7 +233,157 @@ async function resolveProjectPaths(
  *   - Appended to prompts if no context variables are present (to ensure AI receives context)
  *   Expected format: Markdown with issue title, author, labels, and body
  */
+/** Default workflow-level loop_until backstop. */
+const DEFAULT_MAX_ITERATIONS = 20;
+
+/**
+ * Top-level workflow entry point.
+ *
+ * When `workflow.loop_until` is set, runs `runWorkflowIteration` repeatedly
+ * (each call creates a fresh `WorkflowRun` row with the same `user_message`,
+ * scoped `nodeOutputs`) until the expression evaluates true against the
+ * just-completed iteration's node outputs, or `max_iterations` is reached.
+ * Pause and failure short-circuit the loop.
+ *
+ * When `loop_until` is unset, behaves identically to a single `runWorkflowIteration`.
+ */
 export async function executeWorkflow(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  cwd: string,
+  workflow: WorkflowDefinition,
+  userMessage: string,
+  conversationDbId: string,
+  codebaseId?: string,
+  issueContext?: string,
+  isolationContext?: {
+    branchName?: string;
+    isPrReview?: boolean;
+    prSha?: string;
+    prBranch?: string;
+  },
+  parentConversationId?: string,
+  preCreatedRun?: WorkflowRun
+): Promise<WorkflowExecutionResult> {
+  const loopUntil = workflow.loop_until;
+  if (!loopUntil) {
+    return runWorkflowIteration(
+      deps,
+      platform,
+      conversationId,
+      cwd,
+      workflow,
+      userMessage,
+      conversationDbId,
+      codebaseId,
+      issueContext,
+      isolationContext,
+      parentConversationId,
+      preCreatedRun
+    );
+  }
+
+  const maxIterations = workflow.max_iterations ?? DEFAULT_MAX_ITERATIONS;
+  let lastResult: WorkflowExecutionResult | undefined;
+
+  for (let iteration = 1; iteration <= maxIterations; iteration++) {
+    // Iteration 1 may use the orchestrator's pre-created run row; subsequent
+    // iterations always create their own fresh row.
+    const iterationPreCreatedRun = iteration === 1 ? preCreatedRun : undefined;
+
+    lastResult = await runWorkflowIteration(
+      deps,
+      platform,
+      conversationId,
+      cwd,
+      workflow,
+      userMessage,
+      conversationDbId,
+      codebaseId,
+      issueContext,
+      isolationContext,
+      parentConversationId,
+      iterationPreCreatedRun
+    );
+
+    // Short-circuit on failure or pause — the user must intervene.
+    if (!lastResult.success) {
+      return lastResult;
+    }
+    if ('paused' in lastResult && lastResult.paused) {
+      return lastResult;
+    }
+
+    // Evaluate loop_until against the just-completed run's nodeOutputs.
+    const runId = lastResult.workflowRunId;
+    let completedOutputs: Map<string, string>;
+    try {
+      completedOutputs = await deps.store.getCompletedDagNodeOutputs(runId);
+    } catch (error) {
+      const err = error as Error;
+      getLog().error(
+        { err, workflowRunId: runId, iteration },
+        'workflow.loop_until_outputs_load_failed'
+      );
+      return {
+        success: false,
+        workflowRunId: runId,
+        error: `loop_until: failed to load completed node outputs: ${err.message}`,
+      };
+    }
+
+    const nodeOutputsMap = new Map<string, NodeOutput>();
+    for (const [nodeId, output] of completedOutputs) {
+      nodeOutputsMap.set(nodeId, { state: 'completed', output });
+    }
+
+    const { result: shouldStop, parsed } = evaluateCondition(loopUntil, nodeOutputsMap);
+
+    if (!parsed) {
+      getLog().error(
+        { workflowName: workflow.name, workflowRunId: runId, loopUntil, iteration },
+        'workflow.loop_until_unparseable'
+      );
+      return {
+        success: false,
+        workflowRunId: runId,
+        error: `loop_until expression unparseable: '${loopUntil}'`,
+      };
+    }
+
+    if (shouldStop) {
+      getLog().info(
+        { workflowName: workflow.name, workflowRunId: runId, iteration, loopUntil },
+        'workflow.loop_until_satisfied'
+      );
+      return lastResult;
+    }
+
+    getLog().info(
+      { workflowName: workflow.name, workflowRunId: runId, iteration, maxIterations },
+      'workflow.loop_until_iteration_continuing'
+    );
+  }
+
+  // Max iterations exhausted without termination.
+  const finalRunId = lastResult?.success ? lastResult.workflowRunId : undefined;
+  getLog().error(
+    { workflowName: workflow.name, maxIterations, loopUntil },
+    'workflow.loop_until_max_iterations_exceeded'
+  );
+  return {
+    success: false,
+    workflowRunId: finalRunId,
+    error: `loop_until: max_iterations (${String(maxIterations)}) reached without satisfying '${loopUntil}'`,
+  };
+}
+
+/**
+ * Run a single workflow iteration. This is the original `executeWorkflow`
+ * body, factored out to support workflow-level `loop_until` re-invocation.
+ */
+async function runWorkflowIteration(
   deps: WorkflowDeps,
   platform: IWorkflowPlatform,
   conversationId: string,
