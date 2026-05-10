@@ -47,6 +47,7 @@ import {
   isApprovalNode,
   isCancelNode,
   isScriptNode,
+  isWorkflowNode,
   isApprovalContext,
 } from './schemas';
 import { formatToolCall } from './utils/tool-formatter';
@@ -2837,6 +2838,19 @@ export async function executeDagWorkflow(
               config.envVars
             );
             return { nodeId: node.id, output };
+          }
+
+          // Workflow invocation nodes: schema is wired (this slice), but executor
+          // dispatch lands in a follow-up slice (issue #119). Fail clearly until then.
+          if (isWorkflowNode(node)) {
+            return {
+              nodeId: node.id,
+              output: {
+                state: 'failed',
+                output: '',
+                error: `workflow invocation node '${node.id}' is not yet executable (issue #119)`,
+              },
+            };
           }
 
           // 4. Resolve per-node provider/model/options

@@ -3,10 +3,12 @@ import {
   isBashNode,
   isCancelNode,
   isScriptNode,
+  isWorkflowNode,
   isTriggerRule,
   TRIGGER_RULES,
   SCRIPT_NODE_AI_FIELDS,
   LOOP_NODE_AI_FIELDS,
+  WORKFLOW_NODE_AI_FIELDS,
   approvalOnRejectSchema,
   dagNodeSchema,
 } from './schemas';
@@ -18,6 +20,7 @@ import type {
   BashNode,
   CancelNode,
   ScriptNode,
+  WorkflowInvocationNode,
   TriggerRule,
 } from './schemas';
 
@@ -692,6 +695,159 @@ describe('LOOP_NODE_AI_FIELDS', () => {
     ];
     for (const field of expectedFields) {
       expect(LOOP_NODE_AI_FIELDS).toContain(field);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WORKFLOW_NODE_AI_FIELDS constant
+// ---------------------------------------------------------------------------
+
+describe('WORKFLOW_NODE_AI_FIELDS', () => {
+  test('matches BASH_NODE_AI_FIELDS (child workflow nodes carry their own AI config)', () => {
+    expect(WORKFLOW_NODE_AI_FIELDS).toEqual(SCRIPT_NODE_AI_FIELDS);
+  });
+
+  test('contains provider and model fields', () => {
+    expect(WORKFLOW_NODE_AI_FIELDS).toContain('provider');
+    expect(WORKFLOW_NODE_AI_FIELDS).toContain('model');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isWorkflowNode
+// ---------------------------------------------------------------------------
+
+describe('isWorkflowNode', () => {
+  const workflowNode: WorkflowInvocationNode = { id: 'w', workflow: 'child-flow' };
+
+  test('returns true for a WorkflowInvocationNode', () => {
+    expect(isWorkflowNode(workflowNode)).toBe(true);
+  });
+
+  test('returns true for a WorkflowInvocationNode with user_message', () => {
+    const withMsg: WorkflowInvocationNode = {
+      id: 'w',
+      workflow: 'child-flow',
+      user_message: 'hello $picker.output',
+    };
+    expect(isWorkflowNode(withMsg)).toBe(true);
+  });
+
+  test('returns false for a CommandNode', () => {
+    expect(isWorkflowNode({ id: 'c', command: 'build' } as DagNode)).toBe(false);
+  });
+
+  test('returns false for a PromptNode', () => {
+    expect(isWorkflowNode({ id: 'p', prompt: 'go' } as DagNode)).toBe(false);
+  });
+
+  test('returns false for a BashNode', () => {
+    expect(isWorkflowNode({ id: 'b', bash: 'echo' } as DagNode)).toBe(false);
+  });
+
+  test('returns false when workflow is not a string (malformed node)', () => {
+    const malformed = { id: 'x', workflow: 42 } as unknown as DagNode;
+    expect(isWorkflowNode(malformed)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// dagNodeSchema — workflow invocation node
+// ---------------------------------------------------------------------------
+
+describe('dagNodeSchema (workflow invocation)', () => {
+  test('accepts { id, workflow } and produces a WorkflowInvocationNode', () => {
+    const result = dagNodeSchema.safeParse({ id: 'w', workflow: 'child-flow' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.id).toBe('w');
+      expect(isWorkflowNode(result.data)).toBe(true);
+      if (isWorkflowNode(result.data)) {
+        expect(result.data.workflow).toBe('child-flow');
+      }
+    }
+  });
+
+  test('accepts { id, workflow, user_message }', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'w',
+      workflow: 'child-flow',
+      user_message: '$picker.output',
+    });
+    expect(result.success).toBe(true);
+    if (result.success && isWorkflowNode(result.data)) {
+      expect(result.data.user_message).toBe('$picker.output');
+    }
+  });
+
+  test('preserves depends_on on workflow nodes', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'w',
+      workflow: 'child-flow',
+      depends_on: ['picker'],
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.depends_on).toEqual(['picker']);
+    }
+  });
+
+  test('rejects empty workflow string', () => {
+    const result = dagNodeSchema.safeParse({ id: 'w', workflow: '' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some(i => i.message.includes("'workflow'"))).toBe(true);
+    }
+  });
+
+  test('rejects workflow + prompt (mutually exclusive)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'w',
+      workflow: 'child-flow',
+      prompt: 'do this',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('mutually exclusive');
+    }
+  });
+
+  test('rejects workflow + command (mutually exclusive)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'w',
+      workflow: 'child-flow',
+      command: 'build',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('mutually exclusive');
+    }
+  });
+
+  test('rejects workflow + bash (mutually exclusive)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'w',
+      workflow: 'child-flow',
+      bash: 'echo hi',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('mutually exclusive');
+    }
+  });
+
+  test('strips AI-only fields from workflow nodes', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'w',
+      workflow: 'child-flow',
+      effort: 'high',
+      thinking: 'adaptive',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect('effort' in result.data).toBe(false);
+      expect('thinking' in result.data).toBe(false);
     }
   });
 });
