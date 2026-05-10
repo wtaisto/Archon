@@ -422,6 +422,74 @@ nodes:
       expect(workflows[0].name).toBe('discovered');
     });
 
+    it('should reject a workflow that invokes an unknown workflow by name', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      const invokerYaml = `name: invoker
+description: invokes a missing workflow
+nodes:
+  - id: dispatch
+    workflow: nonexistent
+`;
+      await writeFile(join(workflowDir, 'invoker.yaml'), invokerYaml);
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+
+      expect(result.workflows).toHaveLength(0);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].errorType).toBe('validation_error');
+      expect(result.errors[0].error).toContain("unknown workflow 'nonexistent'");
+      expect(result.errors[0].error).toContain("Node 'dispatch'");
+    });
+
+    it('should reject a workflow that invokes itself by name', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      const selfRefYaml = `name: recurser
+description: invokes itself
+nodes:
+  - id: dispatch
+    workflow: recurser
+`;
+      await writeFile(join(workflowDir, 'recurser.yaml'), selfRefYaml);
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+
+      expect(result.workflows).toHaveLength(0);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("workflow self-reference 'recurser'");
+    });
+
+    it('should accept a valid invocation when the target workflow exists', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      const childYaml = `name: child
+description: child workflow
+nodes:
+  - id: leaf
+    command: noop
+`;
+      const parentYaml = `name: parent
+description: invokes child
+nodes:
+  - id: dispatch
+    workflow: child
+    user_message: hello
+`;
+      await writeFile(join(workflowDir, 'child.yaml'), childYaml);
+      await writeFile(join(workflowDir, 'parent.yaml'), parentYaml);
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(2);
+      const names = result.workflows.map(w => w.workflow.name).sort();
+      expect(names).toEqual(['child', 'parent']);
+    });
+
     it('should return empty array when no workflow folders exist', async () => {
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const workflows = result.workflows.map(ws => ws.workflow);
