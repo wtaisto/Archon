@@ -13,6 +13,8 @@ import * as envVarDb from '../db/env-vars';
 import { getAgentProvider } from '@archon/providers';
 import { loadConfig as loadMergedConfig } from '../config/config-loader';
 import { createLogger } from '@archon/paths';
+import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
+import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 
 // Compile-time assertion: MergedConfig must remain a structural subtype of WorkflowConfig.
 // If MergedConfig drifts from WorkflowConfig, this line becomes a type error.
@@ -71,5 +73,13 @@ export function createWorkflowDeps(): WorkflowDeps {
     store: createWorkflowStore(),
     getAgentProvider,
     loadConfig: loadMergedConfig,
+    loadWorkflowRegistry: async (cwd: string): Promise<ReadonlyMap<string, WorkflowDefinition>> => {
+      const result = await discoverWorkflowsWithConfig(cwd, loadMergedConfig);
+      const map = new Map<string, WorkflowDefinition>();
+      for (const { workflow } of result.workflows) {
+        map.set(workflow.name, workflow);
+      }
+      return map;
+    },
   };
 }

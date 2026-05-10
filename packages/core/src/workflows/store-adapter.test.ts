@@ -46,6 +46,8 @@ mock.module('../db/codebases', () => ({
 
 mock.module('@archon/providers', () => ({
   getAgentProvider: mock(() => ({})),
+  isRegisteredProvider: mock(() => true),
+  getRegisteredProviders: mock(() => [{ id: 'claude' }]),
 }));
 
 mock.module('../config/config-loader', () => ({

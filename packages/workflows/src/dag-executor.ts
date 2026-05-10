@@ -34,6 +34,7 @@ import type {
   PromptNode,
   LoopNode,
   ScriptNode,
+  WorkflowInvocationNode,
   NodeOutput,
   TriggerRule,
   WorkflowRun,
@@ -2476,6 +2477,254 @@ async function executeApprovalNode(
 }
 
 /**
+ * Maximum nested workflow-invocation depth before runaway recursion is
+ * suspected. Cross-workflow cycle detection (A→B→A) is intentionally
+ * out of scope at load time (#118); this static cap is the v1 guard.
+ */
+const MAX_WORKFLOW_INVOCATION_DEPTH = 10;
+
+/**
+ * Execute a workflow-invocation node: substitute the user_message, resolve
+ * the named child workflow, create a child WorkflowRun with isolated scope,
+ * and recurse into executeDagWorkflow. Bubble the child's terminal output
+ * up as this node's output, and propagate the child's cancel/pause status
+ * to the parent run.
+ *
+ * Scope isolation: the child receives a fresh nodeOutputs map. Parent
+ * outputs are unreachable from the child; the child's outputs are not
+ * exposed back to the parent except through this node's bubbled output.
+ */
+async function executeWorkflowInvocationNode(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  cwd: string,
+  parentRun: WorkflowRun,
+  node: WorkflowInvocationNode,
+  workflowProvider: string,
+  workflowModel: string | undefined,
+  artifactsDir: string,
+  logDir: string,
+  baseBranch: string,
+  docsDir: string,
+  config: WorkflowConfig,
+  nodeOutputs: Map<string, NodeOutput>,
+  issueContext: string | undefined,
+  parentRecursionDepth: number,
+  configuredCommandFolder: string | undefined
+): Promise<NodeOutput> {
+  const nodeContext: SendMessageContext = { workflowId: parentRun.id, nodeName: node.id };
+  getLog().info(
+    { nodeId: node.id, target: node.workflow, depth: parentRecursionDepth + 1 },
+    'dag.workflow_invocation_started'
+  );
+
+  // 1. Recursion-depth guard
+  if (parentRecursionDepth + 1 > MAX_WORKFLOW_INVOCATION_DEPTH) {
+    const err = `Node '${node.id}': workflow invocation depth ${String(parentRecursionDepth + 1)} exceeds limit ${String(MAX_WORKFLOW_INVOCATION_DEPTH)} (possible cross-workflow cycle in '${node.workflow}')`;
+    return { state: 'failed', output: '', error: err };
+  }
+
+  // 2. Resolve registry — required for invocation
+  if (!deps.loadWorkflowRegistry) {
+    return {
+      state: 'failed',
+      output: '',
+      error: `Node '${node.id}': workflow invocation requires deps.loadWorkflowRegistry — none provided`,
+    };
+  }
+
+  let registry: ReadonlyMap<string, { name: string; nodes: readonly DagNode[] }>;
+  try {
+    registry = await deps.loadWorkflowRegistry(cwd);
+  } catch (error) {
+    const err = error as Error;
+    return {
+      state: 'failed',
+      output: '',
+      error: `Node '${node.id}': failed to load workflow registry: ${err.message}`,
+    };
+  }
+
+  const childWorkflow = registry.get(node.workflow);
+  if (!childWorkflow) {
+    return {
+      state: 'failed',
+      output: '',
+      error: `Node '${node.id}': unknown workflow '${node.workflow}' (registry has ${String(registry.size)} entries)`,
+    };
+  }
+
+  // 3. Substitute user_message — supports $WORKFLOW_ID/$ARGUMENTS/$ISSUE_CONTEXT and
+  // $<id>.output references back into the parent's nodeOutputs.
+  const rawMessage = node.user_message ?? '';
+  let childMessage: string;
+  try {
+    const { prompt: afterVars } = substituteWorkflowVariables(
+      rawMessage,
+      parentRun.id,
+      parentRun.user_message,
+      artifactsDir,
+      baseBranch,
+      docsDir,
+      issueContext
+    );
+    childMessage = substituteNodeOutputRefs(afterVars, nodeOutputs, false);
+  } catch (error) {
+    const err = error as Error;
+    return {
+      state: 'failed',
+      output: '',
+      error: `Node '${node.id}': user_message substitution failed: ${err.message}`,
+    };
+  }
+
+  // 4. Create child WorkflowRun. Same conversation/codebase/working_path as
+  // parent — we're recursing within the same execution context, not
+  // dispatching a separate orchestration. parent_conversation_id traces the
+  // child back to the parent's conversation for observability.
+  let childRun: WorkflowRun;
+  try {
+    childRun = await deps.store.createWorkflowRun({
+      workflow_name: childWorkflow.name,
+      conversation_id: parentRun.conversation_id,
+      codebase_id: parentRun.codebase_id ?? undefined,
+      user_message: childMessage,
+      working_path: cwd,
+      metadata: {
+        parent_workflow_run_id: parentRun.id,
+        parent_node_id: node.id,
+        ...(issueContext ? { github_context: issueContext } : {}),
+      },
+      parent_conversation_id: parentRun.conversation_id,
+    });
+  } catch (error) {
+    const err = error as Error;
+    getLog().error(
+      { err, nodeId: node.id, target: node.workflow, parentRunId: parentRun.id },
+      'dag.workflow_invocation_create_run_failed'
+    );
+    return {
+      state: 'failed',
+      output: '',
+      error: `Node '${node.id}': failed to create child workflow run: ${err.message}`,
+    };
+  }
+
+  // 5. Promote child to running, register with emitter, emit workflow_started.
+  // The recursive executeDagWorkflow call handles its own completion lifecycle
+  // (workflow_completed/_failed events, terminal status writes, unregister).
+  const emitter = getWorkflowEventEmitter();
+  emitter.registerRun(childRun.id, conversationId);
+  emitter.emit({
+    type: 'workflow_started',
+    runId: childRun.id,
+    workflowName: childWorkflow.name,
+    conversationId: parentRun.conversation_id,
+  });
+  try {
+    await deps.store.updateWorkflowRun(childRun.id, { status: 'running' });
+  } catch (error) {
+    getLog().warn(
+      { err: error as Error, childRunId: childRun.id },
+      'dag.workflow_invocation_promote_running_failed'
+    );
+  }
+
+  // 6. Recurse — child receives a FRESH nodeOutputs map (scope isolation).
+  // workflowProvider/workflowModel default from parent; the child's own
+  // workflow-level provider/model are not surfaced here (child workflows
+  // re-resolve per-node via existing precedence).
+  let childSummary: string | undefined;
+  let recursionError: Error | undefined;
+  try {
+    childSummary = await executeDagWorkflow(
+      deps,
+      platform,
+      conversationId,
+      cwd,
+      childWorkflow,
+      childRun,
+      workflowProvider,
+      workflowModel,
+      artifactsDir,
+      logDir,
+      baseBranch,
+      docsDir,
+      config,
+      configuredCommandFolder,
+      issueContext,
+      undefined,
+      parentRecursionDepth + 1
+    );
+  } catch (error) {
+    recursionError = error as Error;
+    getLog().error(
+      { err: recursionError, nodeId: node.id, childRunId: childRun.id },
+      'dag.workflow_invocation_recursion_threw'
+    );
+  }
+
+  // 7. Inspect child's final status and propagate cancel/pause to parent.
+  const childStatus = await deps.store
+    .getWorkflowRunStatus(childRun.id)
+    .catch((statusErr: Error) => {
+      getLog().warn(
+        { err: statusErr, childRunId: childRun.id },
+        'dag.workflow_invocation_child_status_check_failed'
+      );
+      return null;
+    });
+
+  if (childStatus === 'cancelled') {
+    await deps.store.cancelWorkflowRun(parentRun.id).catch((cancelErr: Error) => {
+      getLog().warn(
+        { err: cancelErr, parentRunId: parentRun.id },
+        'dag.workflow_invocation_parent_cancel_failed'
+      );
+    });
+    await safeSendMessage(
+      platform,
+      conversationId,
+      `❌ Child workflow \`${childWorkflow.name}\` was cancelled — propagating to parent.`,
+      nodeContext
+    );
+    return {
+      state: 'failed',
+      output: '',
+      error: `child workflow '${childWorkflow.name}' cancelled`,
+    };
+  }
+
+  if (childStatus === 'paused') {
+    await deps.store
+      .pauseWorkflowRun(parentRun.id, {
+        nodeId: node.id,
+        message: `Paused: child workflow '${childWorkflow.name}' is awaiting approval`,
+      })
+      .catch((pauseErr: Error) => {
+        getLog().warn(
+          { err: pauseErr, parentRunId: parentRun.id },
+          'dag.workflow_invocation_parent_pause_failed'
+        );
+      });
+    return { state: 'completed', output: childSummary ?? '' };
+  }
+
+  if (recursionError || (childStatus !== 'completed' && childStatus !== null)) {
+    return {
+      state: 'failed',
+      output: '',
+      error: recursionError
+        ? `child workflow '${childWorkflow.name}' threw: ${recursionError.message}`
+        : `child workflow '${childWorkflow.name}' ended in state '${childStatus ?? 'unknown'}'`,
+    };
+  }
+
+  return { state: 'completed', output: childSummary ?? '' };
+}
+
+/**
  * Execute a complete DAG workflow.
  * Called from executeWorkflow() in executor.ts.
  */
@@ -2495,7 +2744,14 @@ export async function executeDagWorkflow(
   config: WorkflowConfig,
   configuredCommandFolder?: string,
   issueContext?: string,
-  priorCompletedNodes?: Map<string, string>
+  priorCompletedNodes?: Map<string, string>,
+  /**
+   * Internal: depth of nested workflow-invocation calls. The top-level run
+   * starts at 0; each child increments by 1. Guards against runaway
+   * recursion when workflows reference each other transitively (cross-
+   * workflow cycle detection at load time is out of scope per #118).
+   */
+  recursionDepth = 0
 ): Promise<string | undefined> {
   const dagStartTime = Date.now();
   const workflowLevelOptions = {
@@ -2840,17 +3096,32 @@ export async function executeDagWorkflow(
             return { nodeId: node.id, output };
           }
 
-          // Workflow invocation nodes: schema is wired (this slice), but executor
-          // dispatch lands in a follow-up slice (issue #119). Fail clearly until then.
+          // 3f. Workflow invocation node — recurse into a child workflow with
+          // an isolated nodeOutputs scope. The child's terminal output bubbles
+          // up as this node's $output. Cancel/pause from the child propagate
+          // to the parent via direct status transition (the between-layer
+          // check below sees parent != 'running' and breaks the loop).
           if (isWorkflowNode(node)) {
-            return {
-              nodeId: node.id,
-              output: {
-                state: 'failed',
-                output: '',
-                error: `workflow invocation node '${node.id}' is not yet executable (issue #119)`,
-              },
-            };
+            const output = await executeWorkflowInvocationNode(
+              deps,
+              platform,
+              conversationId,
+              cwd,
+              workflowRun,
+              node,
+              workflowProvider,
+              workflowModel,
+              artifactsDir,
+              logDir,
+              baseBranch,
+              docsDir,
+              config,
+              nodeOutputs,
+              issueContext,
+              recursionDepth,
+              configuredCommandFolder
+            );
+            return { nodeId: node.id, output };
           }
 
           // 4. Resolve per-node provider/model/options

@@ -8,7 +8,7 @@
  * No more mirror copies — single source of truth for IAgentProvider, MessageChunk, etc.
  */
 import type { IWorkflowStore } from './store';
-import type { ModelReasoningEffort, WebSearchMode } from './schemas';
+import type { ModelReasoningEffort, WebSearchMode, WorkflowDefinition } from './schemas';
 import type {
   IAgentProvider,
   MessageChunk,
@@ -112,4 +112,11 @@ export interface WorkflowDeps {
   store: IWorkflowStore;
   getAgentProvider: AgentProviderFactory;
   loadConfig: (cwd: string) => Promise<WorkflowConfig>;
+  /**
+   * Resolve the workflow registry for a given working directory. Used by
+   * workflow-invocation nodes to look up the named child workflow at run
+   * time. Optional so test deps can omit it; the workflow-invocation
+   * branch fails clearly when a child cannot be resolved.
+   */
+  loadWorkflowRegistry?: (cwd: string) => Promise<ReadonlyMap<string, WorkflowDefinition>>;
 }

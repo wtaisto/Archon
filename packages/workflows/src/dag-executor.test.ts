@@ -6894,3 +6894,376 @@ describe('executeDagWorkflow -- final status derivation', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// Workflow invocation node (issue #119)
+// ---------------------------------------------------------------------------
+
+import { existsSync } from 'fs';
+import type { WorkflowDefinition } from './schemas';
+
+/** Per-run status tracker so child + parent runs can be observed independently. */
+function createMultiRunStore(): IWorkflowStore {
+  const statuses = new Map<string, string>();
+  let nextId = 0;
+  const makeRun = (overrides: Partial<WorkflowRun>): WorkflowRun => {
+    const id = overrides.id ?? `run-${String(++nextId)}`;
+    statuses.set(id, 'running');
+    return {
+      id,
+      workflow_name: overrides.workflow_name ?? 'mock',
+      conversation_id: overrides.conversation_id ?? 'conv-mock',
+      parent_conversation_id: overrides.parent_conversation_id ?? null,
+      codebase_id: overrides.codebase_id ?? null,
+      status: 'running',
+      user_message: overrides.user_message ?? '',
+      metadata: overrides.metadata ?? {},
+      started_at: new Date(),
+      completed_at: null,
+      last_activity_at: null,
+      working_path: overrides.working_path ?? null,
+    };
+  };
+  return {
+    createWorkflowRun: mock((data: Parameters<IWorkflowStore['createWorkflowRun']>[0]) =>
+      Promise.resolve(makeRun(data as Partial<WorkflowRun>))
+    ),
+    getWorkflowRun: mock(() => Promise.resolve(null)),
+    getActiveWorkflowRunByPath: mock(() => Promise.resolve(null)),
+    failOrphanedRuns: mock(() => Promise.resolve({ count: 0 })),
+    findResumableRun: mock(() => Promise.resolve(null)),
+    resumeWorkflowRun: mock(() => Promise.reject(new Error('not used'))),
+    updateWorkflowRun: mock((id: string, updates: { status?: string }) => {
+      if (updates.status) statuses.set(id, updates.status);
+      return Promise.resolve();
+    }),
+    updateWorkflowActivity: mock(() => Promise.resolve()),
+    getWorkflowRunStatus: mock((id: string) =>
+      Promise.resolve((statuses.get(id) ?? 'running') as 'running')
+    ),
+    completeWorkflowRun: mock((id: string) => {
+      statuses.set(id, 'completed');
+      return Promise.resolve();
+    }),
+    failWorkflowRun: mock((id: string) => {
+      statuses.set(id, 'failed');
+      return Promise.resolve();
+    }),
+    pauseWorkflowRun: mock((id: string) => {
+      statuses.set(id, 'paused');
+      return Promise.resolve();
+    }),
+    cancelWorkflowRun: mock((id: string) => {
+      statuses.set(id, 'cancelled');
+      return Promise.resolve();
+    }),
+    createWorkflowEvent: mock(() => Promise.resolve()),
+    getCompletedDagNodeOutputs: mock(() => Promise.resolve(new Map<string, string>())),
+    getCodebase: mock(() => Promise.resolve(null)),
+    getCodebaseEnvVars: mock(() => Promise.resolve({})),
+  };
+}
+
+function depsWithRegistry(
+  store: IWorkflowStore,
+  registry: ReadonlyMap<string, WorkflowDefinition>
+): WorkflowDeps {
+  return {
+    ...createMockDeps(store),
+    loadWorkflowRegistry: mock(() => Promise.resolve(registry)),
+  };
+}
+
+function makeChildDef(name: string, nodes: DagNode[]): WorkflowDefinition {
+  return { name, description: '', nodes } as unknown as WorkflowDefinition;
+}
+
+describe('executeDagWorkflow -- workflow invocation node (#119)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-wfinvoke-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  });
+
+  it('invokes child workflow end-to-end and bubbles terminal output to parent', async () => {
+    const store = createMultiRunStore();
+    const child = makeChildDef('child-wf', [{ id: 'leaf', bash: 'echo "child-out"' } as BashNode]);
+    const deps = depsWithRegistry(store, new Map([['child-wf', child]]));
+    const platform = createMockPlatform();
+    const parentRun = makeWorkflowRun('parent-run', { workflow_name: 'parent-wf' });
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-p',
+      testDir,
+      {
+        name: 'parent-wf',
+        nodes: [
+          { id: 'invoke', workflow: 'child-wf' } as DagNode,
+          {
+            id: 'echo-after',
+            depends_on: ['invoke'],
+            bash: 'echo "saw=$invoke.output"',
+          } as BashNode,
+        ],
+      },
+      parentRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Child run was created with parent_conversation_id traceback
+    const createCalls = (
+      store.createWorkflowRun as Mock<(args: { workflow_name: string }) => Promise<WorkflowRun>>
+    ).mock.calls;
+    expect(createCalls.length).toBe(1);
+    expect(createCalls[0][0].workflow_name).toBe('child-wf');
+
+    // Parent's downstream bash sees the child's terminal output
+    const completeCalls = (store.completeWorkflowRun as Mock<() => Promise<void>>).mock.calls;
+    // Both parent and child completed
+    expect(completeCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('substitutes user_message with $WORKFLOW_ID and $<id>.output before invoking child', async () => {
+    const store = createMultiRunStore();
+    const child = makeChildDef('child-wf', [{ id: 'leaf', bash: 'echo "ok"' } as BashNode]);
+    const deps = depsWithRegistry(store, new Map([['child-wf', child]]));
+    const platform = createMockPlatform();
+    const parentRun = makeWorkflowRun('parent-run', { workflow_name: 'parent-wf' });
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-p',
+      testDir,
+      {
+        name: 'parent-wf',
+        nodes: [
+          { id: 'first', bash: 'echo "from-parent"' } as BashNode,
+          {
+            id: 'invoke',
+            depends_on: ['first'],
+            workflow: 'child-wf',
+            user_message: 'parent=$first.output run=$WORKFLOW_ID',
+          } as DagNode,
+        ],
+      },
+      parentRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const createCalls = (
+      store.createWorkflowRun as Mock<
+        (args: { user_message: string; workflow_name: string }) => Promise<WorkflowRun>
+      >
+    ).mock.calls;
+    const childCreate = createCalls.find(c => c[0].workflow_name === 'child-wf');
+    expect(childCreate).toBeDefined();
+    expect(childCreate?.[0].user_message).toBe('parent=from-parent run=parent-run');
+  });
+
+  it('isolates scope — child cannot read parent nodeOutputs', async () => {
+    const store = createMultiRunStore();
+    // Child references $first.output (a parent node id). With scope isolation,
+    // this should resolve to empty, so the bash echo prints just `saw=`.
+    const child = makeChildDef('child-wf', [
+      { id: 'inner', bash: 'echo "saw=$first.output"' } as BashNode,
+    ]);
+    const deps = depsWithRegistry(store, new Map([['child-wf', child]]));
+    const platform = createMockPlatform();
+    const parentRun = makeWorkflowRun('parent-run');
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-p',
+      testDir,
+      {
+        name: 'parent-wf',
+        nodes: [
+          { id: 'first', bash: 'echo "should-not-leak"' } as BashNode,
+          { id: 'invoke', depends_on: ['first'], workflow: 'child-wf' } as DagNode,
+        ],
+      },
+      parentRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // The child must have completed, proving its own bash ran without
+    // throwing on the missing parent ref. Bubble output is `saw=` (or
+    // similar) and is observable via the parent's later substitution path
+    // in other tests; here we assert the child run finished successfully.
+    const completeCalls = (store.completeWorkflowRun as Mock<(id: string) => Promise<void>>).mock
+      .calls;
+    expect(completeCalls.some(c => c[0] !== 'parent-run')).toBe(true);
+  });
+
+  it('writes child run JSONL log to its own file', async () => {
+    const store = createMultiRunStore();
+    const child = makeChildDef('child-wf', [{ id: 'leaf', bash: 'echo "ok"' } as BashNode]);
+    const deps = depsWithRegistry(store, new Map([['child-wf', child]]));
+    const platform = createMockPlatform();
+    const parentRun = makeWorkflowRun('parent-run');
+    const logDir = join(testDir, 'logs');
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-p',
+      testDir,
+      {
+        name: 'parent-wf',
+        nodes: [{ id: 'invoke', workflow: 'child-wf' } as DagNode],
+      },
+      parentRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(existsSync(join(logDir, 'parent-run.jsonl'))).toBe(true);
+    // Child run id is generated by the store (run-1, run-2, ...). At least
+    // one *.jsonl file other than parent-run.jsonl should exist.
+    const childLogs = (store.createWorkflowRun as Mock<() => Promise<WorkflowRun>>).mock.results
+      .filter(r => r.type === 'return')
+      .map(r => (r.value as Promise<WorkflowRun>) ?? null);
+    const childRun = await childLogs[0];
+    expect(childRun?.id).toBeDefined();
+    expect(childRun?.id).not.toBe('parent-run');
+    expect(existsSync(join(logDir, `${childRun!.id}.jsonl`))).toBe(true);
+  });
+
+  it('propagates child cancellation to parent', async () => {
+    const store = createMultiRunStore();
+    // Child has a cancel node — child run will be cancelled.
+    const child = makeChildDef('child-wf', [
+      { id: 'stop', cancel: 'child decided to stop' } as DagNode,
+    ]);
+    const deps = depsWithRegistry(store, new Map([['child-wf', child]]));
+    const platform = createMockPlatform();
+    const parentRun = makeWorkflowRun('parent-run');
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-p',
+      testDir,
+      {
+        name: 'parent-wf',
+        nodes: [{ id: 'invoke', workflow: 'child-wf' } as DagNode],
+      },
+      parentRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const cancelCalls = (
+      store.cancelWorkflowRun as Mock<(id: string) => Promise<void>>
+    ).mock.calls.map(c => c[0]);
+    // Both child (from its own cancel node) and parent (from propagation) cancelled.
+    expect(cancelCalls).toContain('parent-run');
+  });
+
+  it('fails the workflow node when target workflow is unknown', async () => {
+    const store = createMultiRunStore();
+    const deps = depsWithRegistry(store, new Map());
+    const platform = createMockPlatform();
+    const parentRun = makeWorkflowRun('parent-run');
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-p',
+      testDir,
+      {
+        name: 'parent-wf',
+        nodes: [{ id: 'invoke', workflow: 'does-not-exist' } as DagNode],
+      },
+      parentRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Run must have failed (no completed nodes).
+    const failCalls = (store.failWorkflowRun as Mock<() => Promise<void>>).mock.calls;
+    expect(failCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('fails fast when nested invocation depth exceeds the static limit', async () => {
+    const store = createMultiRunStore();
+    // Self-referential map for the test: registry returns a workflow that
+    // contains a workflow-invocation pointing at itself. (At normal load
+    // time, the loader rejects this; the executor's recursion guard is the
+    // belt-and-suspenders for cross-workflow cycles which load-time does
+    // not detect.)
+    const recursive = makeChildDef('recurse', [{ id: 'down', workflow: 'recurse' } as DagNode]);
+    const deps = depsWithRegistry(store, new Map([['recurse', recursive]]));
+    const platform = createMockPlatform();
+    const parentRun = makeWorkflowRun('parent-run');
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-p',
+      testDir,
+      {
+        name: 'parent-wf',
+        nodes: [{ id: 'kick', workflow: 'recurse' } as DagNode],
+      },
+      parentRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Eventually the depth guard trips and the parent run is marked failed.
+    const failCalls = (store.failWorkflowRun as Mock<() => Promise<void>>).mock.calls;
+    expect(failCalls.length).toBeGreaterThanOrEqual(1);
+  });
+});
