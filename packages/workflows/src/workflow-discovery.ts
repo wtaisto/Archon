@@ -28,6 +28,7 @@ import * as archonPaths from '@archon/paths';
 import { BUNDLED_WORKFLOWS, isBinaryBuild } from './defaults/bundled-defaults';
 import { createLogger } from '@archon/paths';
 import { parseWorkflow } from './loader';
+import { isWorkflowNode } from './schemas';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -339,12 +340,72 @@ export async function discoverWorkflows(
     getLog().debug({ workflowPath }, 'workflow_folder_not_found');
   }
 
+  // Cross-workflow validation: now that the full registry is assembled,
+  // resolve every workflow-invocation node's `workflow:` ref to a known
+  // workflow name, and reject self-references (a workflow invoking itself).
+  // Cross-workflow cycles (A→B→A) are out of scope for v1; the executor
+  // will guard against runaway recursion separately.
+  validateWorkflowInvocations(workflowsByFile, allErrors);
+
   const workflows = Array.from(workflowsByFile.values());
   getLog().info(
     { count: workflows.length, errorCount: allErrors.length },
     'workflows_discovery_completed'
   );
   return { workflows, errors: allErrors };
+}
+
+/**
+ * Validate that every workflow-invocation node references a known workflow
+ * name. Mutates `workflowsByFile` (drops invalid entries) and `errors`
+ * (appends a WorkflowLoadError per dropped workflow).
+ *
+ * Resolution scope: the assembled registry across bundled, global, and project
+ * scopes — same as the `name`-based lookup used elsewhere (router.ts).
+ *
+ * Errors raised:
+ *   - `Node 'X': unknown workflow 'Y'. Known: a, b, c`
+ *   - `Node 'X': workflow self-reference 'Y' (a workflow cannot invoke itself)`
+ */
+function validateWorkflowInvocations(
+  workflowsByFile: Map<string, WorkflowWithSource>,
+  errors: WorkflowLoadError[]
+): void {
+  const knownNames = new Set<string>();
+  for (const { workflow } of workflowsByFile.values()) {
+    knownNames.add(workflow.name);
+  }
+  const knownList = [...knownNames].sort().join(', ');
+
+  // Collect filenames to drop in a second pass (avoid mutating the map mid-iteration).
+  const toDrop: { filename: string; error: string }[] = [];
+
+  for (const [filename, { workflow }] of workflowsByFile) {
+    for (const node of workflow.nodes) {
+      if (!isWorkflowNode(node)) continue;
+      const target = node.workflow;
+      if (target === workflow.name) {
+        toDrop.push({
+          filename,
+          error: `Node '${node.id}': workflow self-reference '${target}' (a workflow cannot invoke itself)`,
+        });
+        break;
+      }
+      if (!knownNames.has(target)) {
+        toDrop.push({
+          filename,
+          error: `Node '${node.id}': unknown workflow '${target}'. Known: ${knownList}`,
+        });
+        break;
+      }
+    }
+  }
+
+  for (const { filename, error } of toDrop) {
+    workflowsByFile.delete(filename);
+    errors.push({ filename, error, errorType: 'validation_error' });
+    getLog().warn({ filename, error }, 'workflow_invocation_validation_failed');
+  }
 }
 
 /**
